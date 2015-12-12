@@ -14,7 +14,7 @@ go get -u github.com/newhook/go-symbols
 # Using
 
 ```
-> go-symbols -ignore=.git,vendor /Users/matthew/go foo
+> go-symbols /Users/matthew/go foo
 ```
 
 # Schema

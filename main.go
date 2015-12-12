@@ -1,3 +1,4 @@
+// The gosymbols command prints type information for package-level symbols.
 package main
 
 import (
@@ -6,20 +7,29 @@ import (
 	"fmt"
 	"go/ast"
 	"go/build"
+	"go/parser"
 	"go/token"
-	"go/types"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
-	"github.com/newhook/go-symbols/importer"
+	"golang.org/x/tools/go/buildutil"
 )
 
-var fset = token.NewFileSet()
-var info = types.Info{
-	Defs: map[*ast.Ident]types.Object{},
+const usage = `Usage: gosymbols <package> ...`
+
+func init() {
+	flag.Var((*buildutil.TagsFlag)(&build.Default.BuildTags), "tags", buildutil.TagsFlagDoc)
+}
+
+func main() {
+	if err := doMain(); err != nil {
+		fmt.Fprintf(os.Stderr, "go-symbols: %s\n", err)
+		os.Exit(1)
+	}
 }
 
 type symbol struct {
@@ -31,125 +41,207 @@ type symbol struct {
 	Character int    `json:"character"`
 }
 
-type ignoreList struct {
-	val []string
+var mutex sync.Mutex
+var syms = make([]symbol, 0)
+
+type visitor struct {
+	pkg   *ast.Package
+	fset  *token.FileSet
+	query string
+	syms  []symbol
 }
 
-func (ss *ignoreList) contains(name string) bool {
-	for _, d := range ss.val {
-		if name == d {
-			return true
+func (v *visitor) Visit(node ast.Node) bool {
+	descend := true
+
+	var ident *ast.Ident
+	var kind string
+	switch t := node.(type) {
+	case *ast.FuncDecl:
+		kind = "func"
+		ident = t.Name
+		descend = false
+
+	case *ast.TypeSpec:
+		kind = "type"
+		ident = t.Name
+		descend = false
+	}
+
+	if ident != nil && strings.Contains(strings.ToLower(ident.Name), v.query) {
+		f := v.fset.File(ident.Pos())
+		v.syms = append(v.syms, symbol{
+			Package: v.pkg.Name,
+			Path:    f.Name(),
+			Name:    ident.Name,
+			Kind:    kind,
+			Line:    f.Line(ident.Pos()) - 1,
+		})
+	}
+
+	return descend
+}
+
+var	haveSrcDir = true
+
+func forEachPackage(ctxt *build.Context, found func(importPath string, err error)) {
+	// We use a counting semaphore to limit
+	// the number of parallel calls to ReadDir.
+	sema := make(chan bool, 20)
+
+	ch := make(chan item)
+
+	var srcDirs []string
+	if haveSrcDir {
+		srcDirs	= ctxt.SrcDirs()
+	} else {
+		srcDirs = append(srcDirs, ctxt.GOPATH)
+	}
+	
+	var wg sync.WaitGroup
+	for _, root := range srcDirs {
+		root := root
+		wg.Add(1)
+		go func() {
+			allPackages(ctxt, sema, root, ch)
+			wg.Done()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	// All calls to found occur in the caller's goroutine.
+	for i := range ch {
+		found(i.importPath, i.err)
+	}
+}
+
+type item struct {
+	importPath string
+	err        error // (optional)
+}
+
+func allPackages(ctxt *build.Context, sema chan bool, root string, ch chan<- item) {
+	root = filepath.Clean(root) + string(os.PathSeparator)
+
+	var wg sync.WaitGroup
+
+	var walkDir func(dir string)
+	walkDir = func(dir string) {
+		// Avoid .foo, _foo, and testdata directory trees.
+		base := filepath.Base(dir)
+		if base == "" || base[0] == '.' || base[0] == '_' || base == "testdata" {
+			return
 		}
-	}
-	return false
-}
 
-func (ss *ignoreList) Set(s string) error {
-	ss.val = strings.Split(s, ",")
-	return nil
-}
+		pkg := filepath.ToSlash(strings.TrimPrefix(dir, root))
 
-func (ss *ignoreList) String() string {
-	return fmt.Sprintf("%v", ss.val)
-}
+		// Prune search if we encounter any of these import paths.
+		switch pkg {
+		case "builtin":
+			return
+		}
 
-var ignore ignoreList
-
-func init() {
-	flag.Var(&ignore, "ignore", "set of entries to ignore")
-}
-
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: go-symbols [flags] directory [query]\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-	if flag.NArg() < 2 {
-		flag.Usage()
-		os.Exit(2)
-	}
-
-	dir := flag.Arg(0)
-	var query string
-	if flag.NArg() > 1 {
-		query = flag.Arg(1)
-	}
-
-	importer := importer.NewWalker(fset, &build.Default, dir, &info)
-
-	srcDir := filepath.Join(dir, "src")
-	fi, err := os.Stat(srcDir)
-	if err == nil && fi.IsDir() {
-		dir = srcDir
-	}
-
-	root := dir
-
-	local := map[*types.Package]bool{}
-	var walk func(dir string) error
-	walk = func(dir string) error {
+		sema <- true
 		files, err := ioutil.ReadDir(dir)
-		if err != nil {
-			return err
+		<-sema
+		if pkg != "" || err != nil {
+			ch <- item{pkg, err}
 		}
-		pkg, err := importer.ImportPackage(dir[len(root):], dir)
-
-		if pkg != nil {
-			local[pkg] = true
-		}
-
-		for _, f := range files {
-			if f.IsDir() && !ignore.contains(f.Name()) {
-				walk(filepath.Join(dir, f.Name()))
+		for _, fi := range files {
+			fi := fi
+			if fi.IsDir() {
+				wg.Add(1)
+				go func() {
+					walkDir(filepath.Join(dir, fi.Name()))
+					wg.Done()
+				}()
 			}
 		}
-		return nil
-	}
-	err = walk(dir)
-	if err != nil {
-		log.Fatalf("error walking tree: %v\n", err)
 	}
 
+	walkDir(root)
+	wg.Wait()
+}
+
+func doMain() error {
+	flag.Parse()
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	args := flag.Args()
+
+	if len(args) < 1 {
+		fmt.Fprint(os.Stderr, usage)
+		os.Exit(1)
+	}
+
+	dir := args[0]
+	var query string
+	if len(args) > 1 {
+		query = args[1]
+	}
 	query = strings.ToLower(query)
-	var syms []symbol
-	for s, typ := range info.Defs {
-		if typ == nil {
-			continue
-		}
 
-		pkg := typ.Pkg()
-		if pkg == nil {
-			continue
-		}
+	ctxt := build.Default // copy
+	ctxt.GOPATH = dir     // disable GOPATH
+	ctxt.GOROOT = ""
 
-		if _, ok := local[pkg]; !ok {
-			continue
-		}
+	fset := token.NewFileSet()
+	sema := make(chan int, 8) // concurrency-limiting semaphore
+	var wg sync.WaitGroup
 
-		sym := symbol{
-			Package: typ.Pkg().Name(),
-			Path:    fset.File(s.NamePos).Name(),
-			Name:    s.Name,
-		}
-
-		if s.Obj != nil {
-			sym.Kind = s.Obj.Kind.String()
-		} else {
-			// Functions don't have an Obj as the type checker was run with
-			// IgnoreFuncBodies=true.
-			sym.Kind = "func"
-		}
-
-		if !strings.Contains(strings.ToLower(sym.Name), query) {
-			continue
-		}
-
-		f := fset.File(s.NamePos)
-		sym.Line = f.Line(s.NamePos) - 1
-		syms = append(syms, sym)
+	if _, err := os.Stat(filepath.Join(dir, "src")); err != nil {
+		haveSrcDir = false
 	}
+	
+	// Here we can't use buildutil.ForEachPackage here since it only considers
+	// src dirs and this tool should be able to run against a golang source dir.
+	forEachPackage(&ctxt, func(path string, err error) {
+		if path == "" {
+			return
+		}
+		wg.Add(1)
+		go func() {
+			sema <- 1 // acquire token
+			defer func() {
+				<-sema // release token
+			}()
+
+			v := &visitor{
+				fset:  fset,
+				query: query,
+			}
+			defer func() {
+				mutex.Lock()
+				syms = append(syms, v.syms...)
+				mutex.Unlock()
+			}()
+
+			defer wg.Done()
+			
+			if haveSrcDir {
+				path = filepath.Join(dir, "src", path)
+			} else {
+				path = filepath.Join(dir, path)
+			}
+
+			parsed, _ := parser.ParseDir(fset, path, nil, 0)
+			// Ignore any errors, they are irrelevant for symbol search.
+
+			for _, astpkg := range parsed {
+				v.pkg = astpkg
+				for _, f := range astpkg.Files {
+					ast.Inspect(f, v.Visit)
+				}
+			}
+		}()
+	})
+	wg.Wait()
 
 	b, _ := json.MarshalIndent(syms, "", " ")
 	fmt.Println(string(b))
+
+	return nil
 }
