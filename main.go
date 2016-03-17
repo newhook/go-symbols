@@ -9,9 +9,8 @@ import (
 	"go/build"
 	"go/parser"
 	"go/token"
-	"io/ioutil"
+	"log"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -53,7 +52,6 @@ type visitor struct {
 
 func (v *visitor) Visit(node ast.Node) bool {
 	descend := true
-
 	var ident *ast.Ident
 	var kind string
 	switch t := node.(type) {
@@ -82,124 +80,48 @@ func (v *visitor) Visit(node ast.Node) bool {
 	return descend
 }
 
-var	haveSrcDir = true
-
-func forEachPackage(ctxt *build.Context, found func(importPath string, err error)) {
-	// We use a counting semaphore to limit
-	// the number of parallel calls to ReadDir.
-	sema := make(chan bool, 20)
-
-	ch := make(chan item)
-
-	var srcDirs []string
-	if haveSrcDir {
-		srcDirs	= ctxt.SrcDirs()
-	} else {
-		srcDirs = append(srcDirs, ctxt.GOPATH)
-	}
-	
-	var wg sync.WaitGroup
-	for _, root := range srcDirs {
-		root := root
-		wg.Add(1)
-		go func() {
-			allPackages(ctxt, sema, root, ch)
-			wg.Done()
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	// All calls to found occur in the caller's goroutine.
-	for i := range ch {
-		found(i.importPath, i.err)
-	}
-}
-
-type item struct {
-	importPath string
-	err        error // (optional)
-}
-
-func allPackages(ctxt *build.Context, sema chan bool, root string, ch chan<- item) {
-	root = filepath.Clean(root) + string(os.PathSeparator)
-
-	var wg sync.WaitGroup
-
-	var walkDir func(dir string)
-	walkDir = func(dir string) {
-		// Avoid .foo, _foo, and testdata directory trees.
-		base := filepath.Base(dir)
-		if base == "" || base[0] == '.' || base[0] == '_' || base == "testdata" {
-			return
-		}
-
-		pkg := filepath.ToSlash(strings.TrimPrefix(dir, root))
-
-		// Prune search if we encounter any of these import paths.
-		switch pkg {
-		case "builtin":
-			return
-		}
-
-		sema <- true
-		files, err := ioutil.ReadDir(dir)
-		<-sema
-		if pkg != "" || err != nil {
-			ch <- item{pkg, err}
-		}
-		for _, fi := range files {
-			fi := fi
-			if fi.IsDir() {
-				wg.Add(1)
-				go func() {
-					walkDir(filepath.Join(dir, fi.Name()))
-					wg.Done()
-				}()
-			}
-		}
-	}
-
-	walkDir(root)
-	wg.Wait()
-}
-
 func doMain() error {
+	var dir, query string
+
 	flag.Parse()
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	args := flag.Args()
-
-	if len(args) < 1 {
+	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
 	}
+	dir = args[0]
 
-	dir := args[0]
-	var query string
 	if len(args) > 1 {
 		query = args[1]
 	}
+
+	// Bail early with an unbounded search.
+	// TODO: refactor me.
+	if len(query) < 1 {
+		b, _ := json.MarshalIndent(syms, "", " ")
+		fmt.Println(string(b))
+		os.Exit(0)
+	}
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	query = strings.ToLower(query)
 
 	ctxt := build.Default // copy
-	ctxt.GOPATH = dir     // disable GOPATH
-	ctxt.GOROOT = ""
+	if len(dir) > 0 {
+		// TODO: Build a buildutil.FakeContext out of a directory which exists outside a GOPATH
+	}
 
 	fset := token.NewFileSet()
 	sema := make(chan int, 8) // concurrency-limiting semaphore
 	var wg sync.WaitGroup
 
-	if _, err := os.Stat(filepath.Join(dir, "src")); err != nil {
-		haveSrcDir = false
-	}
-	
-	// Here we can't use buildutil.ForEachPackage here since it only considers
-	// src dirs and this tool should be able to run against a golang source dir.
-	forEachPackage(&ctxt, func(path string, err error) {
-		if path == "" {
+	buildutil.ForEachPackage(&ctxt, func(path string, err error) {
+		if err != nil {
+			log.Printf("Error in package %s: %s", path, err)
+			return
+		}
+		if len(path) == 0 {
 			return
 		}
 		wg.Add(1)
@@ -220,15 +142,10 @@ func doMain() error {
 			}()
 
 			defer wg.Done()
-			
-			if haveSrcDir {
-				path = filepath.Join(dir, "src", path)
-			} else {
-				path = filepath.Join(dir, path)
-			}
 
-			parsed, _ := parser.ParseDir(fset, path, nil, 0)
-			// Ignore any errors, they are irrelevant for symbol search.
+			// Ignore errors; some packages contain no source.
+			pkg, _ := ctxt.Import(path, "", 0)
+			parsed, _ := parser.ParseDir(fset, pkg.Dir, nil, 0)
 
 			for _, astpkg := range parsed {
 				v.pkg = astpkg
