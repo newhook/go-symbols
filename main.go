@@ -21,8 +21,12 @@ import (
 
 const usage = `Usage: gosymbols <package> ...`
 
+var ignoreFoldersString string
+var ignoreFolders []string
+
 func init() {
 	flag.Var((*buildutil.TagsFlag)(&build.Default.BuildTags), "tags", buildutil.TagsFlagDoc)
+	flag.StringVar(&ignoreFoldersString, "ignore", "", "a comma-separated list of folders to ignore.")
 }
 
 func main() {
@@ -82,7 +86,7 @@ func (v *visitor) Visit(node ast.Node) bool {
 	return descend
 }
 
-var	haveSrcDir = true
+var haveSrcDir = true
 
 func forEachPackage(ctxt *build.Context, found func(importPath string, err error)) {
 	// We use a counting semaphore to limit
@@ -93,11 +97,11 @@ func forEachPackage(ctxt *build.Context, found func(importPath string, err error
 
 	var srcDirs []string
 	if haveSrcDir {
-		srcDirs	= ctxt.SrcDirs()
+		srcDirs = ctxt.SrcDirs()
 	} else {
 		srcDirs = append(srcDirs, ctxt.GOPATH)
 	}
-	
+
 	var wg sync.WaitGroup
 	for _, root := range srcDirs {
 		root := root
@@ -134,6 +138,11 @@ func allPackages(ctxt *build.Context, sema chan bool, root string, ch chan<- ite
 		base := filepath.Base(dir)
 		if base == "" || base[0] == '.' || base[0] == '_' || base == "testdata" {
 			return
+		}
+		for _, ignoredFolder := range ignoreFolders {
+			if base == ignoredFolder {
+				return
+			}
 		}
 
 		pkg := filepath.ToSlash(strings.TrimPrefix(dir, root))
@@ -172,6 +181,10 @@ func doMain() error {
 
 	args := flag.Args()
 
+	if ignoreFoldersString != "" {
+		ignoreFolders = strings.Split(ignoreFoldersString, ",")
+	}
+
 	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -195,7 +208,7 @@ func doMain() error {
 	if _, err := os.Stat(filepath.Join(dir, "src")); err != nil {
 		haveSrcDir = false
 	}
-	
+
 	// Here we can't use buildutil.ForEachPackage here since it only considers
 	// src dirs and this tool should be able to run against a golang source dir.
 	forEachPackage(&ctxt, func(path string, err error) {
@@ -220,7 +233,7 @@ func doMain() error {
 			}()
 
 			defer wg.Done()
-			
+
 			if haveSrcDir {
 				path = filepath.Join(dir, "src", path)
 			} else {
